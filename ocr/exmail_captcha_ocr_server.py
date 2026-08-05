@@ -149,6 +149,47 @@ def add_candidate(candidates, value):
         candidates.append(value)
 
 
+def flip_cost(position, base_char, crop_texts):
+    """改掉第 position 位的大小写，要付多大代价。
+
+    代价 = 该位 crop 证据的强度。证据强(置信度高)就不该动它，证据弱或
+    无效就优先翻转。这样排序只依赖每张图自己的证据，不引入拿少量标注
+    拟合出来的全局先验。
+
+    关键：必须先确认 crop 认出的就是该位那个字母，否则不算证据。实测
+    live_03 第3位 crop 给的是 "HM"(两个字符)、第4位是 "V"(字母都不对)，
+    这些不是「该位是小写」的证据，只是识别失败；若按置信度计入代价，
+    反而会把真正该翻转的位锁死。
+    """
+    if position >= len(crop_texts):
+        return 0.0
+    crop_text, confidence = crop_texts[position]
+    crop_char = crop_text[:1]
+    if len(crop_text) != 1 or identity_char(crop_char) != identity_char(base_char):
+        return 0.0
+    return float(confidence)
+
+
+def order_variants(variants, anchor, crop_texts):
+    """把大小写变体按「最可能是真值」排序。
+
+    脚本每页最多提交 5 次(maxSubmitAttemptsPerPage)，每次换一个候选，所以
+    候选顺序直接决定成功率。原来这里是 RNG.shuffle 随机洗牌，等于放弃排序,
+    实测真值常被排到第 10/11/15 位，5 次重试根本吃不到。
+
+    排序规则：先按与 anchor(当前最优猜测)的汉明距离升序 —— 实测真值与
+    anchor 的距离全是 1~2，距离 1 只有 4 个变体，所以真值会很靠前。同距离
+    内按「翻转代价」升序，即先翻证据最弱的位。
+    """
+    def key(variant):
+        diff = [i for i in range(min(len(variant), len(anchor))) if variant[i] != anchor[i]]
+        cost = sum(flip_cost(i, anchor[i], crop_texts) for i in diff)
+        # 代价为主、距离为辅：证据都无效时翻两位可能比翻一个有强证据的位更该优先
+        return (cost, len(diff))
+
+    return sorted(variants, key=key)
+
+
 def rapid_texts(image_bytes):
     """Whole-line reading via RapidOCR's full detect-then-recognise pipeline.
 
@@ -404,8 +445,7 @@ def choose_code(image_bytes):
     base = default if len(default) == 4 else beta
     if len(base) == 4:
         upper_priority = [item for item in candidates if same_identity(base, item) and item != default]
-        variants = case_variants(base)
-        RNG.shuffle(variants)
+        variants = order_variants(case_variants(base), enhanced or base, crop_texts)
         for variant in variants:
             add_candidate(candidates, variant)
 
