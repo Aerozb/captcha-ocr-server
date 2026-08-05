@@ -1,12 +1,69 @@
 import base64
 import io
 import json
+import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import ddddocr
-import numpy as np
-from PIL import Image
+HOST = "127.0.0.1"
+PORT = 17898
+
+# RapidOCR's DBNet detection pass used to run on every request and cost ~478 ms
+# of a ~640 ms total, because it upscales this 130x53 captcha to its 736 px
+# minimum side before detecting. We never needed it: the characters are always
+# the only ink on the image, so split_boxes() locates them with plain numpy in
+# ~1 ms. Only the recognition session is used now, which is why the thread count
+# below is tuned for small tensors instead of for detection.
+#
+# Measured on this 8-core box, whole-request mean over the 70-sample set:
+#   1 thread 137 ms | 2 threads 88 | 3 threads 74 | 4 threads 73 | 6 threads 78 | 8 threads 83
+# Beyond 4 the thread-sync overhead exceeds the compute saved, so using every
+# logical core (the previous setting) was actively slower.
+REC_THREADS = min(4, os.cpu_count() or 4)
+
+
+def _tune_onnxruntime():
+    """Force thread count and disable spin-waiting on every ONNX session.
+
+    ORT intra-op worker threads busy-wait for their next task by default. We run
+    three sessions per request (ddddocr default, ddddocr beta, RapidOCR
+    recognition), so while one is inferring the other two keep spinning and
+    steal the cores it needs. Disabling that took the whole request from 121 ms
+    to 73 ms here, and inference output is bit-identical either way.
+
+    ddddocr constructs its InferenceSession internally and exposes no way to
+    pass session options, so wrapping the constructor is the only hook. Done
+    before ddddocr/rapidocr are imported so it applies to their models too.
+    """
+    try:
+        import onnxruntime as ort
+    except Exception:
+        return
+
+    real_session = ort.InferenceSession
+
+    class TunedSession(real_session):
+        def __init__(self, path_or_bytes, sess_options=None, providers=None, **kwargs):
+            options = sess_options or ort.SessionOptions()
+            try:
+                options.intra_op_num_threads = REC_THREADS
+                options.inter_op_num_threads = 1
+                options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            except Exception:
+                options = sess_options
+            if providers is None:
+                providers = ["CPUExecutionProvider"]
+            super().__init__(path_or_bytes, sess_options=options, providers=providers, **kwargs)
+
+    ort.InferenceSession = TunedSession
+
+
+_tune_onnxruntime()
+
+import ddddocr  # noqa: E402  (must follow _tune_onnxruntime)
+import numpy as np  # noqa: E402
+from PIL import Image, ImageDraw  # noqa: E402
 
 try:
     from rapidocr_onnxruntime import RapidOCR
@@ -14,17 +71,45 @@ except Exception:
     RapidOCR = None
 
 
-HOST = "127.0.0.1"
-PORT = 17898
+def _make_rapid():
+    if RapidOCR is None:
+        return None
+    try:
+        return RapidOCR(
+            intra_op_num_threads=REC_THREADS,
+            det_use_cuda=False,
+            rec_use_cuda=False,
+            cls_use_cuda=False,
+        )
+    except Exception:
+        try:
+            return RapidOCR(intra_op_num_threads=REC_THREADS)
+        except Exception:
+            return RapidOCR()
+
+
 OCR = ddddocr.DdddOcr(show_ad=False)
 OCR_BETA = ddddocr.DdddOcr(show_ad=False, beta=True)
-RAPID = RapidOCR() if RapidOCR else None
+RAPID = _make_rapid()
 RNG = random.SystemRandom()
 CONFUSIONS = str.maketrans({"0": "o", "O": "o", "9": "g"})
 
+# The two ddddocr models and the RapidOCR batch are independent ONNX sessions and
+# release the GIL during inference, so overlapping them hides the cheaper one.
+POOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="ocr")
+
 
 def clean_text(text):
-    return "".join(ch for ch in str(text or "") if ch.isalnum())[:6]
+    """只保留 ASCII 字母数字。
+
+    不能用 str.isalnum()：它对任意 Unicode 字母数字都返回 True，所以西里尔、
+    中文、希腊字符都能混进来。实测 rapidocr 的字符集确实会吐出这类字符
+    （例：把一个 x 识别成西里尔 һ U+04BB），结果是服务端自认为给出了 4 字符
+    答案，而油猴脚本用 /[^0-9a-zA-Z]/ 一过滤就只剩 3 个字符被判为无效。
+    更麻烦的是大小写还原是按位置对齐的，串里混入会被下游剥掉的字符会让
+    整个对齐错位。这里提前过滤掉，服务端和客户端的字符集就一致了。
+    """
+    return "".join(ch for ch in str(text or "") if ch.isascii() and ch.isalnum())[:6]
 
 
 def signal_text(text):
@@ -65,6 +150,11 @@ def add_candidate(candidates, value):
 
 
 def rapid_texts(image_bytes):
+    """Whole-line reading via RapidOCR's full detect-then-recognise pipeline.
+
+    Kept only so the benchmark scripts in .local/ can still measure the old path.
+    The server uses rapid_pass(), which skips detection; see the note there.
+    """
     if RAPID is None:
         return []
     try:
@@ -123,23 +213,55 @@ def split_boxes(image, count=4):
     return boxes
 
 
-def rapid_crop_texts(image):
+def char_canvas(image, box):
+    """A character box centred on a fixed white canvas, as the recogniser expects."""
+    crop = image.crop(box)
+    canvas = Image.new("RGB", (64, 64), "white")
+    crop.thumbnail((56, 56))
+    canvas.paste(crop, ((64 - crop.width) // 2, (64 - crop.height) // 2))
+    return np.array(canvas)
+
+
+def rapid_pass(image):
+    """Whole-line and per-character readings in a single recognition batch.
+
+    Replaces RapidOCR's detect-then-recognise pipeline. Detection cost ~478 ms
+    per image and, worse, found no text at all on 25 of our 70 samples, leaving
+    the case-restoration logic with no signal. Cropping to the ink bounding box
+    that split_boxes() already computes feeds the recogniser directly and reads
+    61 of 70 - more coverage, ~19x cheaper.
+
+    The line crop and the four character crops go in one text_rec() call. Every
+    input is zero-padded to the same width regardless (max_wh_ratio has a floor
+    of rec_image_shape[2]/rec_image_shape[1]), so batching them together yields
+    byte-identical text and confidences to calling them separately, one less
+    session round-trip.
+
+    Returns (rapid_list, crop_texts) matching the old rapid_texts() /
+    rapid_crop_texts() shapes.
+    """
     if RAPID is None:
-        return []
+        return [], []
     try:
-        crops = []
-        for box in split_boxes(image):
-            crop = image.crop(box)
-            canvas = Image.new("RGB", (64, 64), "white")
-            crop.thumbnail((56, 56))
-            canvas.paste(crop, ((64 - crop.width) // 2, (64 - crop.height) // 2))
-            crops.append(np.array(canvas))
-        if not crops:
-            return []
-        result, _elapsed = RAPID.text_rec(crops)
-        return [(signal_text(text), float(confidence)) for text, confidence in result]
+        boxes = split_boxes(image)
+        if not boxes:
+            return [], []
+        line_box = (
+            min(b[0] for b in boxes),
+            min(b[1] for b in boxes),
+            max(b[2] for b in boxes),
+            max(b[3] for b in boxes),
+        )
+        batch = [np.array(image.crop(line_box))]
+        batch.extend(char_canvas(image, box) for box in boxes)
+
+        result, _elapsed = RAPID.text_rec(batch)
+        line_text = clean_text(result[0][0])
+        rapid_list = [line_text[:4]] if len(line_text) >= 4 else []
+        crop_texts = [(signal_text(text), float(confidence)) for text, confidence in result[1:]]
+        return rapid_list, crop_texts
     except Exception:
-        return []
+        return [], []
 
 
 def align_signal(base, text):
@@ -179,18 +301,42 @@ def align_signal(base, text):
     return output
 
 
-def trust_upper(base_char, position, crop_texts):
+# 这些字母的大写和小写字形基本相同，只能靠「相对其他字符的高度」区分。
+# 整行识别器会把行高归一化掉，所以它对这些字母吐出的大小写**不携带任何信息**，
+# 只反映模型自身的全大写倾向（实测整行把 pgbp 读成 Psbp、zSPB 读成 ZSPB、
+# ynyn 读成 YIny，首字母无一例外被抬成大写）。因此这些字母一律不信整行，
+# 只信逐字符 crop —— crop 是在保留相对尺寸的小图上做的，才真正含高度信息。
+SAME_SHAPE_CASE = frozenset("cosuvwxzpkmnyj")
+
+# 实测 12 张真实验证码上，crop 投大写时：
+#   真值确实大写的置信度 = 0.627 0.664 0.804 0.837 0.844 0.952（最低 0.627）
+#   真值其实小写的置信度 = 0.540（唯一误报，也是最高）
+# 两组不重叠，阈值取 0.60 可完全分开。
+SAME_SHAPE_UPPER_CONF = 0.60
+
+
+def crop_votes_upper(base_char, position, crop_texts, min_conf):
+    """逐字符 crop 是否以足够置信度认为该位是大写。"""
     crop_text, confidence = crop_texts[position] if position < len(crop_texts) else ("", 0.0)
     crop_char = crop_text[:1]
-    crop_is_same_upper = (
+    return (
         len(crop_text) == 1
         and crop_char.isupper()
         and identity_char(crop_char) == base_char
+        and confidence >= min_conf
     )
+
+
+def trust_upper(base_char, position, crop_texts):
+    """整行/引擎信号投了大写时，是否采纳。
+
+    同形字母必须由 crop 印证，因为整行信号对它们没有鉴别力；异形字母
+    （b/d/e/g/h/q/r…）整行能真正看出字形差异，沿用原有的宽松策略。
+    """
+    if base_char in SAME_SHAPE_CASE:
+        return crop_votes_upper(base_char, position, crop_texts, SAME_SHAPE_UPPER_CONF)
     if base_char == "d":
-        return crop_is_same_upper and confidence >= 0.45
-    if base_char in "mns":
-        return crop_is_same_upper and confidence >= 0.60
+        return crop_votes_upper(base_char, position, crop_texts, 0.45)
     return True
 
 
@@ -210,39 +356,47 @@ def apply_crop_signal(output, base, crop_texts):
         crop_char = crop_text[:1]
         if not crop_char or not crop_char.isupper() or identity_char(crop_char) != base_char:
             continue
-        threshold = 0.25
-        if base_char == "d":
+        # 同形字母走统一的高阈值，否则这里的宽松默认值(0.25)会绕过 trust_upper
+        # 的把关，把整行的全大写倾向重新放进结果。
+        if base_char in SAME_SHAPE_CASE:
+            threshold = SAME_SHAPE_UPPER_CONF
+        elif base_char == "d":
             threshold = 0.45
-        elif base_char in "mns":
-            threshold = 0.60
         elif base_char == "f":
             threshold = 0.05
+        else:
+            threshold = 0.25
         if confidence >= threshold:
             output[index] = base_char.upper()
 
 
-def enhanced_candidate(image_bytes, default, beta):
+def enhanced_candidate(default, beta, rapid_list, crop_texts):
     base_source = default if len(default) == 4 else beta
     base = identity(base_source)[:4]
     if len(base) != 4:
         return ""
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    crop_texts = rapid_crop_texts(image)
     output = list(base)
-    for signal in [default, beta, *rapid_texts(image_bytes)]:
+    for signal in [default, beta, *rapid_list]:
         apply_case_signal(output, base, signal, crop_texts)
     apply_crop_signal(output, base, crop_texts)
     return "".join(output)
 
 
 def choose_code(image_bytes):
-    default = clean_text(OCR.classification(image_bytes))[:4]
-    beta = signal_text(OCR_BETA.classification(image_bytes))[:4]
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    # Three independent ONNX sessions; each releases the GIL while inferring, so
+    # running them concurrently costs about as much as the slowest one alone.
+    future_default = POOL.submit(OCR.classification, image_bytes)
+    future_beta = POOL.submit(OCR_BETA.classification, image_bytes)
+    rapid_list, crop_texts = rapid_pass(image)
+    default = clean_text(future_default.result())[:4]
+    beta = signal_text(future_beta.result())[:4]
 
     candidates = []
-    enhanced = enhanced_candidate(image_bytes, default, beta)
+    enhanced = enhanced_candidate(default, beta, rapid_list, crop_texts)
     add_candidate(candidates, enhanced)
-    for text in rapid_texts(image_bytes):
+    for text in rapid_list:
         add_candidate(candidates, signal_text(text))
     add_candidate(candidates, beta)
     add_candidate(candidates, default)
@@ -271,6 +425,10 @@ def choose_code(image_bytes):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Keep-alive: the userscript issues a fresh POST per captcha refresh, and on
+    # Windows a new TCP connection per request adds avoidable latency.
+    protocol_version = "HTTP/1.1"
+
     def _send_json(self, status, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -304,7 +462,32 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
+def warmup():
+    """Run one throwaway request through every model.
+
+    ONNX Runtime defers a lot of allocation and kernel selection to the first
+    Run() call, so without this the first real captcha of the session pays a
+    one-off penalty of a few hundred ms - exactly when the user is waiting.
+
+    The synthetic image must contain ink in four separate columns: on a blank
+    image split_boxes() finds nothing and rapid_pass() returns early, leaving
+    the recognition session cold, which is the expensive one.
+    """
+    canvas = Image.new("RGB", (130, 53), "white")
+    draw = ImageDraw.Draw(canvas)
+    for index in range(4):
+        x = 12 + index * 28
+        draw.ellipse((x, 12, x + 18, 40), outline=(0, 0, 160), width=3)
+    buffer = io.BytesIO()
+    canvas.save(buffer, format="PNG")
+    try:
+        choose_code(buffer.getvalue())
+    except Exception:
+        pass
+
+
 def main():
+    warmup()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"exmail captcha OCR server listening on http://{HOST}:{PORT}", flush=True)
     server.serve_forever()
