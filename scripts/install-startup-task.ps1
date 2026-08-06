@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 $root = Resolve-Path (Join-Path $PSScriptRoot '..')
 $startScript = Join-Path $root 'scripts\start-ocr-server-hidden.ps1'

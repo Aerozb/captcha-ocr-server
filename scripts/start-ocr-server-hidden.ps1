@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 # 用共享的 python-runtime.ps1，不要在这里内联一份解析逻辑：共享版把项目
 # .venv 排在第一候选并做 3.10+ 版本校验，内联版两者都没有。内联的后果是
