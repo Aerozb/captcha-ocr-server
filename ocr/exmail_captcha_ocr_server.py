@@ -63,7 +63,7 @@ _tune_onnxruntime()
 
 import ddddocr  # noqa: E402  (must follow _tune_onnxruntime)
 import numpy as np  # noqa: E402
-from PIL import Image, ImageDraw  # noqa: E402
+from PIL import Image, ImageDraw, ImageEnhance  # noqa: E402
 
 try:
     from rapidocr_onnxruntime import RapidOCR
@@ -423,6 +423,26 @@ def enhanced_candidate(default, beta, rapid_list, crop_texts):
     return "".join(output)
 
 
+def contrast_retry(image):
+    """对比度增强后重读，仅用于主引擎吐不出 4 位时的兜底。
+
+    删除线和空心描边字形会让首字符的笔画淡到主引擎直接漏读（live_05 的 'x'、
+    live_12 的 'L' 都是这样丢的，输出只剩 3 位，长度检查不过、候选集为空）。
+    拉高对比度后两张都能读回 4 位。
+
+    实测 70 样本：无条件启用会让 5 张原本 4 位的样本退化成 3 位（对比度增强
+    也会把相邻字符的笔画连到一起），所以只在主引擎已经失败时才试——那时没有
+    可失去的东西。原本 4 位的输出一律不碰。
+    """
+    try:
+        enhanced = ImageEnhance.Contrast(image).enhance(2.5)
+        buffer = io.BytesIO()
+        enhanced.save(buffer, format="PNG")
+        return clean_text(OCR.classification(buffer.getvalue()))[:4]
+    except Exception:
+        return ""
+
+
 def choose_code(image_bytes):
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
@@ -433,6 +453,13 @@ def choose_code(image_bytes):
     rapid_list, crop_texts = rapid_pass(image)
     default = clean_text(future_default.result())[:4]
     beta = signal_text(future_beta.result())[:4]
+
+    # 两个引擎都凑不出 4 位时才走对比度兜底，代价是多一次识别（约 25ms），
+    # 但此时原本的结果已经会被长度检查丢掉，没有可失去的东西。
+    if len(default) != 4 and len(beta) != 4:
+        retried = contrast_retry(image)
+        if len(retried) == 4:
+            default = retried
 
     candidates = []
     enhanced = enhanced_candidate(default, beta, rapid_list, crop_texts)
