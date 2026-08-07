@@ -51,7 +51,7 @@ Register-ScheduledTask `
   -Action $action `
   -Trigger @($logonTrigger, $bootTrigger) `
   -Settings $settings `
-  -Description 'Start local OCR service for Tencent Exmail / LCC-CICD Tampermonkey auto-login.' `
+  -Description 'Start the local captcha OCR service on 127.0.0.1:17898 for auto-login scripts.' `
   -Force | Out-Null
 
 Write-Host "Startup task installed: $taskName"
