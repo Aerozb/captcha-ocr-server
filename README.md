@@ -75,7 +75,44 @@ powershell -ExecutionPolicy Bypass -File scripts\start-ocr-server.ps1
 | `candidates` | 候选列表，按可能性排序，第一个等于 `text` |
 | `default` / `beta` | 两个 ddddocr 模型的原始输出，排查用 |
 
-出错时返回 HTTP 500 和 `{"ok": false, "error": "..."}`。
+出错时返回 HTTP 500 和 `{"ok": false, "error": "..."}`,例如 base64 不合法时是 `{"ok": false, "error": "Incorrect padding"}`。服务不会因为单次请求出错而崩溃。
+
+### 调用示例
+
+Python：
+
+```python
+import base64, json, urllib.request
+
+with open("captcha.png", "rb") as f:
+    payload = {"image": "data:image/png;base64," + base64.b64encode(f.read()).decode()}
+
+req = urllib.request.Request(
+    "http://127.0.0.1:17898/ocr",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"},
+)
+result = json.loads(urllib.request.urlopen(req, timeout=20).read())
+print(result["text"], result["candidates"][:5])
+```
+
+浏览器 / 油猴脚本（需要 `@grant GM_xmlhttpRequest`,因为这是跨源请求）：
+
+```javascript
+GM_xmlhttpRequest({
+  method: 'POST',
+  url: 'http://127.0.0.1:17898/ocr',
+  headers: { 'Content-Type': 'application/json' },
+  data: JSON.stringify({ image: canvas.toDataURL('image/png') }),
+  timeout: 15000,
+  onload: (res) => {
+    const { text, candidates } = JSON.parse(res.responseText);
+    // 提交 candidates[0]；被拒后依次试 candidates[1]、[2]...
+  },
+});
+```
+
+服务已设 `Access-Control-Allow-Origin: *`,浏览器端可直接调用。
 
 ## 重要：请使用 candidates 而不是只用 text
 
@@ -96,16 +133,56 @@ powershell -ExecutionPolicy Bypass -File scripts\start-ocr-server.ps1
 
 ## 性能
 
-单张 88ms（median 83ms），8 核机器实测，70 张样本平均。
+8 核机器实测、70 张样本平均：**最近一次 mean 185–199ms**，最初未优化版本约 1295ms。
 
-从最初的 1295ms 优化而来，主要靠跳过 RapidOCR 的检测阶段（它占 478ms 却对这种图毫无必要）、关掉 ONNX Runtime 自旋等待、以及把线程数调到 4 而不是用满所有核。详见 `AGENTS.md` 的「性能背景」。
+注意这个数字**随机器状态波动很大**——同一份代码在同一台机器上测过 88ms、104ms、185ms。它用来衡量优化的相对效果，不适合当作可复现的性能承诺。需要准确数字时现测：
+
+```powershell
+.venv\Scripts\python.exe .local\bench_one.py ocr\exmail_captcha_ocr_server.py
+```
+
+提速主要靠跳过 RapidOCR 的检测阶段（它占了大部分耗时却对这种图毫无必要）、关掉 ONNX Runtime 自旋等待、以及把线程数调到 4 而不是用满所有核。详见 `AGENTS.md` 的「性能背景」。
+
+## 排障
+
+**服务没响应**
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:17898/
+Get-Content logs\startup-history.log -Tail 20
+Get-ScheduledTask -TaskName ExmailCaptchaOcrServer
+```
+
+`startup-history.log` 是追加式的，每次启动都留记录，包括用了哪个 Python、进程 PID、几秒就绪、或者提前退出的错误。开机后服务不在时先看这个文件。
+
+**改了代码但行为没变**
+
+八成是旧进程还在跑。Python 的 `HTTPServer` 允许多个进程绑定同一端口，新实例不会报错而是与旧实例并存，且由谁应答不确定。先确认全部停掉：
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+  Where-Object { $_.CommandLine -like '*exmail_captcha_ocr_server*' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+powershell -ExecutionPolicy Bypass -File scripts\start-ocr-server-hidden.ps1
+```
+
+正常情况下会看到**两个** python 进程且互为父子——`.venv\Scripts\python.exe` 是转发 stub，会拉起基础解释器作为子进程，这是 venv 的正常行为。
+
+**移动过项目目录**
+
+计划任务里存的是绝对路径，移动后会失效。在新位置重跑 `install-startup-task.ps1` 即可（它用 `-Force` 覆盖注册）。`.venv` 里也有绝对路径，最好删掉重建。
+
+**报「Resolve-PythonRuntime 不是可识别的 cmdlet」**
+
+`.ps1` 文件的 UTF-8 BOM 丢了。没有 BOM 时 PowerShell 5.1 按 GBK 解码，中文注释处解析出错，导致 dot-source 静默失效。用带 BOM 的编码重存即可。
 
 ## 已知限制
 
 - 只针对 4 位字母数字验证码，其他长度未测。
-- 大小写还原是这个服务最弱的一环，同形字母（`cosuvwxzpkmnyj`）的判据依赖一个拟合当前分割方式的置信度阈值，换分割方式会失准。
-- 有个别样本三个引擎会一致认错（B↔D 混淆），加权投票救不了。
-- 真值集只有 12 张，上面所有比例的置信区间都很宽。
+- **大小写还原是这个服务最弱的一环**，同形字母（`cosuvwxzpkmnyj`）的判据依赖一个拟合当前分割方式的置信度阈值，换分割方式会失准。这也是为什么应该用 `candidates` 而不是只用 `text`。
+- 有个别样本三个引擎会一致认错（B↔D 混淆），加权投票救不了，需要换模型或专门训练。
+- **真值集只有 12 张，上面所有比例的置信区间都很宽。** 这些数字用来判断改动方向够用，但不适合当作对外承诺的准确率。
+- 调研过的现成开源模型（HuggingFace 上的通用验证码模型）在本项目数据上实测比现有方案差得多，详见 `AGENTS.md`。
 
 ## 许可
 
