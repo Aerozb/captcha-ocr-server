@@ -1,13 +1,35 @@
 import base64
+import binascii
 import io
 import json
 import os
-import random
+import socket
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 HOST = "127.0.0.1"
 PORT = 17898
+HEALTH_PATH = "/"
+OCR_PATH = "/ocr"
+MAX_REQUEST_BYTES = 2 * 1024 * 1024
+CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+
+class RequestError(ValueError):
+    """可直接映射为 HTTP 客户端错误的请求异常。"""
+
+    def __init__(self, status, message, *, close_connection=False):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.close_connection = close_connection
+
+
+class InvalidImageError(ValueError):
+    """请求内容能完成 base64 解码，但不是 Pillow 可读取的图片。"""
+
 
 # RapidOCR's DBNet detection pass used to run on every request and cost ~478 ms
 # of a ~640 ms total, because it upscales this 130x53 captcha to its 736 px
@@ -63,7 +85,7 @@ _tune_onnxruntime()
 
 import ddddocr  # noqa: E402  (must follow _tune_onnxruntime)
 import numpy as np  # noqa: E402
-from PIL import Image, ImageDraw, ImageEnhance  # noqa: E402
+from PIL import Image, ImageDraw, ImageEnhance, UnidentifiedImageError  # noqa: E402
 
 try:
     from rapidocr_onnxruntime import RapidOCR
@@ -91,7 +113,6 @@ def _make_rapid():
 OCR = ddddocr.DdddOcr(show_ad=False)
 OCR_BETA = ddddocr.DdddOcr(show_ad=False, beta=True)
 RAPID = _make_rapid()
-RNG = random.SystemRandom()
 CONFUSIONS = str.maketrans({"0": "o", "O": "o", "9": "g"})
 
 # The two ddddocr models and the RapidOCR batch are independent ONNX sessions and
@@ -225,6 +246,8 @@ def mask_for(image):
 
 
 def split_boxes(image, count=4):
+    if not isinstance(count, int) or count < 1:
+        return []
     mask = mask_for(image)
     ys, xs = np.where(mask)
     if len(xs) == 0:
@@ -237,6 +260,8 @@ def split_boxes(image, count=4):
         if np.max(np.abs(new_centers - centers)) < 0.1:
             break
         centers = new_centers
+    if labels is None or any(not np.any(labels == index) for index in range(count)):
+        return []
     boxes = []
     for index in np.argsort(centers):
         points = labels == index
@@ -443,8 +468,17 @@ def contrast_retry(image):
         return ""
 
 
+def load_image(image_bytes):
+    """解码请求图片，并把图片格式错误与后续 OCR 推理错误分开。"""
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            return source.convert("RGB")
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise InvalidImageError("image 不是可识别的图片") from exc
+
+
 def choose_code(image_bytes):
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image = load_image(image_bytes)
 
     # Three independent ONNX sessions; each releases the GIL while inferring, so
     # running them concurrently costs about as much as the slowest one alone.
@@ -491,42 +525,153 @@ def choose_code(image_bytes):
     return chosen, candidates, default, beta
 
 
+def parse_content_length(value):
+    if value is None:
+        raise RequestError(400, "缺少 Content-Length", close_connection=True)
+    try:
+        length = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RequestError(400, "Content-Length 无效", close_connection=True) from exc
+    if length < 1:
+        raise RequestError(400, "请求体不能为空", close_connection=True)
+    if length > MAX_REQUEST_BYTES:
+        raise RequestError(413, f"请求体不能超过 {MAX_REQUEST_BYTES} 字节", close_connection=True)
+    return length
+
+
+def decode_image_value(value):
+    if not isinstance(value, str):
+        raise RequestError(400, "image 必须是 base64 字符串")
+    encoded = value.strip()
+    if not encoded:
+        raise RequestError(400, "image 不能为空")
+    if encoded[:5].lower() == "data:":
+        header, separator, encoded = encoded.partition(",")
+        if not separator or ";base64" not in header.lower():
+            raise RequestError(400, "image data URL 必须使用 base64 编码")
+    # base64 常被换行格式化；只剔除空白，其他非法字符仍由 validate=True 拒绝。
+    encoded = "".join(encoded.split())
+    if not encoded:
+        raise RequestError(400, "image 不能为空")
+    try:
+        ascii_bytes = encoded.encode("ascii")
+        image_bytes = base64.b64decode(ascii_bytes, validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError) as exc:
+        raise RequestError(400, "image 不是有效的 base64") from exc
+    if not image_bytes:
+        raise RequestError(400, "image 解码结果为空")
+    return image_bytes
+
+
+def parse_ocr_payload(body):
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RequestError(400, "请求体不是有效的 UTF-8 JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestError(400, "请求体必须是 JSON 对象")
+    if "image" not in payload:
+        raise RequestError(400, "缺少 image 字段")
+    return decode_image_value(payload["image"])
+
+
 class Handler(BaseHTTPRequestHandler):
     # Keep-alive: the userscript issues a fresh POST per captcha refresh, and on
     # Windows a new TCP connection per request adds avoidable latency.
     protocol_version = "HTTP/1.1"
 
+    def _path(self):
+        try:
+            return urlsplit(self.path).path
+        except ValueError:
+            return self.path
+
     def _send_json(self, status, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            if self.close_connection:
+                self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+        except CLIENT_DISCONNECT_ERRORS:
+            # 浏览器切换验证码或关闭页面时可能主动断开，不应打印服务端异常栈。
+            self.close_connection = True
+            return False
+
+    def _send_not_found(self):
+        # POST 的未读请求体不能留给 keep-alive 连接的下一个请求解析。
+        self.close_connection = True
+        self._send_json(404, {"ok": False, "error": "接口不存在"})
 
     def do_OPTIONS(self):
+        if self._path() != OCR_PATH:
+            self._send_not_found()
+            return
         self._send_json(200, {"ok": True})
 
     def do_GET(self):
+        if self._path() != HEALTH_PATH:
+            self._send_not_found()
+            return
         self._send_json(200, {"ok": True, "service": "exmail-captcha-ocr"})
 
     def do_POST(self):
+        if self._path() != OCR_PATH:
+            self._send_not_found()
+            return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            image = payload.get("image", "")
-            if "," in image:
-                image = image.split(",", 1)[1]
-            image_bytes = base64.b64decode(image)
+            lengths = self.headers.get_all("Content-Length", [])
+            if len(lengths) != 1:
+                raise RequestError(400, "必须提供一个 Content-Length", close_connection=True)
+            length = parse_content_length(lengths[0])
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise RequestError(400, "请求体不完整", close_connection=True)
+            image_bytes = parse_ocr_payload(body)
             text, candidates, default, beta = choose_code(image_bytes)
-            self._send_json(200, {"ok": True, "text": text, "candidates": candidates, "default": default, "beta": beta})
+            self._send_json(
+                200,
+                {"ok": True, "text": text, "candidates": candidates, "default": default, "beta": beta},
+            )
+        except CLIENT_DISCONNECT_ERRORS:
+            self.close_connection = True
+        except RequestError as exc:
+            if exc.close_connection:
+                self.close_connection = True
+            self._send_json(exc.status, {"ok": False, "error": exc.message})
+        except InvalidImageError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
         except Exception as exc:
-            self._send_json(500, {"ok": False, "error": str(exc)})
+            print(f"OCR 请求处理失败: {exc!r}", file=sys.stderr, flush=True)
+            self._send_json(500, {"ok": False, "error": "OCR 识别失败"})
 
     def log_message(self, _format, *args):
         return
+
+
+class OcrHttpServer(ThreadingHTTPServer):
+    """本机 OCR HTTP 服务，禁止 Windows 上多个进程静默复用同一端口。"""
+
+    allow_reuse_address = False
+    allow_reuse_port = False
+    daemon_threads = True
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], CLIENT_DISCONNECT_ERRORS):
+            return
+        super().handle_error(request, client_address)
 
 
 def warmup():
@@ -547,17 +692,15 @@ def warmup():
         draw.ellipse((x, 12, x + 18, 40), outline=(0, 0, 160), width=3)
     buffer = io.BytesIO()
     canvas.save(buffer, format="PNG")
-    try:
-        choose_code(buffer.getvalue())
-    except Exception:
-        pass
+    # ddddocr 预热失败必须中止启动，避免健康检查通过但首个真实请求必然失败。
+    choose_code(buffer.getvalue())
 
 
 def main():
     warmup()
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"exmail captcha OCR server listening on http://{HOST}:{PORT}", flush=True)
-    server.serve_forever()
+    with OcrHttpServer((HOST, PORT), Handler) as server:
+        print(f"exmail captcha OCR server listening on http://{HOST}:{PORT}", flush=True)
+        server.serve_forever()
 
 
 if __name__ == "__main__":
