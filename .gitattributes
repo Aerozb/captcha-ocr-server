@@ -4,4 +4,5 @@
 *.md text eol=lf
 *.txt text eol=lf
 *.ps1 text eol=crlf
+*.bat text eol=crlf
 *.user.js linguist-language=JavaScript

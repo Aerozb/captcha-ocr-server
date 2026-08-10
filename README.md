@@ -4,28 +4,40 @@
 
 最初为腾讯企业邮箱（exmail.qq.com）的 4 位字母数字验证码而做，识别逻辑针对这种验证码调优。用在其他站点前需要重新评测。
 
+## 一键管理入口（推荐）
+
+Windows 用户直接双击仓库根目录的 `OCR服务管理.bat`，即可在一个菜单里完成安装、启动、停止、自检和开机自启配置，不需要手动输入 PowerShell 命令。
+
+首次使用推荐按这个顺序执行：
+
+1. `[1] 安装或更新依赖`
+2. `[6] 部署自检`
+3. `[2] 后台启动服务`
+4. `[7] 安装开机自启`（可选，但推荐）
+
+每项任务执行完都会在当前窗口显示成功或失败，按回车就会回到主菜单，可以继续执行下一项。菜单顶部还会显示服务、虚拟环境和开机自启的当前状态。
+
+只有“前台调试启动”会打开一个新的可见窗口，用来持续显示实时输出。原来的管理窗口会轮询健康接口，因此仍会明确报告服务是否启动成功；启动错误则保留在新窗口中，便于直接查看。
+
 ## 环境要求
 
 - Windows 10/11
 - Python 3.10+（3.12 实测可用）
 
-## 安装
+## 命令行安装（进阶）
 
 ```powershell
 # 1. 建 venv 并安装依赖（ddddocr、rapidocr-onnxruntime、Pillow、numpy）
 powershell -ExecutionPolicy Bypass -File scripts\安装依赖.ps1
 
-# 2. 注册开机自启（可选，但推荐）
+# 2. 部署自检
+powershell -ExecutionPolicy Bypass -File scripts\部署自检.ps1
+
+# 3. 注册开机自启（可选，但推荐）
 powershell -ExecutionPolicy Bypass -File scripts\安装开机自启.ps1
 ```
 
-装完可以自检：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\部署自检.ps1
-```
-
-## 手动启动
+## 命令行启动与停止（进阶）
 
 ```powershell
 # 后台启动（幂等，端口已健康就直接退出）
@@ -33,6 +45,9 @@ powershell -ExecutionPolicy Bypass -File scripts\启动服务-后台.ps1
 
 # 前台启动，看实时输出，调试用
 powershell -ExecutionPolicy Bypass -File scripts\启动服务-前台调试.ps1
+
+# 停止本仓库启动的 OCR 服务
+powershell -ExecutionPolicy Bypass -File scripts\停止服务.ps1
 ```
 
 首次启动要加载三个 ONNX 模型，约几秒。启动过程会记进 `logs\startup-history.log`。
@@ -157,16 +172,14 @@ Get-ScheduledTask -TaskName ExmailCaptchaOcrServer
 
 **改了代码但行为没变**
 
-八成是旧进程还在跑。Python 的 `HTTPServer` 允许多个进程绑定同一端口，新实例不会报错而是与旧实例并存，且由谁应答不确定。先确认全部停掉：
+通常是旧进程仍在运行。最简单的处理方式是双击 `OCR服务管理.bat`，然后选择 `[5] 重启后台服务`。命令行方式：
 
 ```powershell
-Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-  Where-Object { $_.CommandLine -like '*exmail_captcha_ocr_server*' } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+powershell -ExecutionPolicy Bypass -File scripts\停止服务.ps1
 powershell -ExecutionPolicy Bypass -File scripts\启动服务-后台.ps1
 ```
 
-正常情况下会看到**两个** python 进程且互为父子——`.venv\Scripts\python.exe` 是转发 stub，会拉起基础解释器作为子进程，这是 venv 的正常行为。
+服务已启用端口排他，同一端口上的第二个实例会直接报告占用。正常运行时仍会看到**两个** python 进程且互为父子——`.venv\Scripts\python.exe` 是转发 stub，会拉起基础解释器作为子进程，这是 venv 的正常行为。
 
 **移动过项目目录**
 

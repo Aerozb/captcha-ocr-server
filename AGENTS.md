@@ -34,11 +34,14 @@
 
 | 路径 | 说明 |
 |------|------|
+| `OCR服务管理.bat` | 面向 Windows 新用户的根目录统一入口，双击后进入循环菜单 |
 | `ocr/exmail_captcha_ocr_server.py` | 服务本体，单文件 |
 | `tests/test_server.py` | HTTP 请求校验、路由、CORS、端口排他与启动预热的自动化测试 |
+| `scripts/ocr-service-menu.ps1` | 管理菜单实现，统一调用各功能脚本并显示结果 |
 | `scripts/安装依赖.ps1` | 建 venv 并装依赖 |
 | `scripts/启动服务-前台调试.ps1` | 前台启动（调试用） |
 | `scripts/启动服务-后台.ps1` | 后台启动，幂等，带启动历史日志 |
+| `scripts/停止服务.ps1` | 只停止命令行中匹配本仓库服务脚本的 Python 进程 |
 | `scripts/安装开机自启.ps1` | 注册开机自启计划任务 |
 | `scripts/卸载开机自启.ps1` | 卸载计划任务 |
 | `scripts/公共-查找Python.ps1` | 共享的 Python 解析（优先项目 `.venv`，校验 3.10+） |
@@ -48,12 +51,25 @@
 
 ## 怎么装
 
+面向最终用户的首选方式是双击根目录 `OCR服务管理.bat`，按菜单提示依次执行 `[1] 安装或更新依赖`、`[6] 部署自检`、`[2] 后台启动服务`；需要开机自动运行时再执行 `[7] 安装开机自启`。
+
+命令行方式仍保留：
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\安装依赖.ps1
+powershell -ExecutionPolicy Bypass -File scripts\部署自检.ps1
+powershell -ExecutionPolicy Bypass -File scripts\启动服务-后台.ps1
 powershell -ExecutionPolicy Bypass -File scripts\安装开机自启.ps1
 ```
 
 需要 Python 3.10+。首次启动要加载三个 ONNX 模型，约几秒。
+
+### 根目录管理入口约定
+
+- `OCR服务管理.bat` 只负责切换到仓库根目录并启动 `scripts/ocr-service-menu.ps1`，不在 BAT 内堆复杂业务逻辑。
+- 安装依赖、自检、后台启动、停止和计划任务配置都在当前窗口执行，菜单根据子进程退出码显示成功或失败，完成后回到根目录并继续循环。
+- 前台调试是唯一打开新窗口的操作。原菜单窗口通过轮询 `GET http://127.0.0.1:17898/` 判断是否真正就绪；错误输出留在新窗口，不能只把“窗口已创建”当作启动成功。
+- 停止脚本只匹配命令行中包含本仓库 `ocr/exmail_captcha_ocr_server.py` 绝对路径的 Python 进程，不按进程名批量终止其他 Python 程序。
 
 ## 改动注意
 
@@ -64,13 +80,8 @@ powershell -ExecutionPolicy Bypass -File scripts\安装开机自启.ps1
   服务现在使用 `OcrHttpServer` 关闭 `SO_REUSEADDR`，并在 Windows 上启用 `SO_EXCLUSIVEADDRUSE`：同一端口的第二个实例会立即绑定失败，不再与旧实例静默并存。重启时仍要先确认旧进程全部退出，否则新进程会明确报端口占用：
 
   ```powershell
-  # 停掉所有旧实例（不能只停一个）
-  Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-    Where-Object { $_.CommandLine -like '*exmail_captcha_ocr_server*' } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-
-  # 确认端口已释放，再启动
-  netstat -ano | Select-String ':17898.*LISTENING'
+  # 停掉本仓库启动的所有服务进程，再重新后台启动
+  powershell -ExecutionPolicy Bypass -File scripts\停止服务.ps1
   powershell -ExecutionPolicy Bypass -File scripts\启动服务-后台.ps1
   ```
 
