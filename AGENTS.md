@@ -35,6 +35,7 @@
 | 路径 | 说明 |
 |------|------|
 | `ocr/exmail_captcha_ocr_server.py` | 服务本体，单文件 |
+| `tests/test_server.py` | HTTP 请求校验、路由、CORS、端口排他与启动预热的自动化测试 |
 | `scripts/install-dependencies.ps1` | 建 venv 并装依赖 |
 | `scripts/start-ocr-server.ps1` | 前台启动（调试用） |
 | `scripts/start-ocr-server-hidden.ps1` | 后台启动，幂等，带启动历史日志 |
@@ -60,7 +61,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install-startup-task.ps1
 
 - **改完代码必须重启服务，否则 17898 端口上跑的还是旧进程。** 这一步极易漏：进程内测试（直接 import 模块）拿到的是新代码，但走 HTTP 的结果仍来自旧进程，两者数字不一致时很容易误判成「改动无效」或反过来把旧结果当成新成果。启动脚本还有「端口已健康就直接退出」的幂等快路径，会让人以为服务已经是新的。
 
-  更麻烦的是 Python 的 `HTTPServer` 设了 `SO_REUSEADDR`，Windows 下**允许多个进程同时绑定 17898**，且由谁应答不确定——新起的实例不会报端口占用，而是和旧实例静默并存。所以重启必须先确认旧进程真的停了：
+  服务现在使用 `OcrHttpServer` 关闭 `SO_REUSEADDR`，并在 Windows 上启用 `SO_EXCLUSIVEADDRUSE`：同一端口的第二个实例会立即绑定失败，不再与旧实例静默并存。重启时仍要先确认旧进程全部退出，否则新进程会明确报端口占用：
 
   ```powershell
   # 停掉所有旧实例（不能只停一个）
@@ -75,6 +76,12 @@ powershell -ExecutionPolicy Bypass -File scripts\install-startup-task.ps1
 
   启动后核对 `logs\startup-history.log` 里的 `using python:` 一行确实指向本仓库的 `.venv`。注意正常情况下会看到**两个** python 进程且互为父子：`.venv\Scripts\python.exe` 是转发 stub，会拉起基础解释器作为子进程，这是 venv 的正常行为，不是多实例。
 
+- 改 HTTP 服务、请求解析或启动流程后，先跑标准库自动化测试：
+
+  ```powershell
+  .venv\Scripts\python.exe -m unittest discover -s tests -v
+  ```
+
 - 改识别逻辑后必须跑回归，确认真值集准确率和 70 样本都不退化：
 
   ```powershell
@@ -86,7 +93,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install-startup-task.ps1
 
   `regress_after_fix.py` 把当前实现与 `.local/_old_server.py` 对比，后者是所有优化之前的原版快照（保留它是为了能随时验证「改了这么多之后字母识别没退化」）。它报告的「不同 33/70」是预期的，那些差异全部只在大小写上；真正要盯的是「含非 ASCII 应为 0」和耗时。
 
-  `e2e_candidates.py` 特意用空闲端口（17905），不要改成 17898——那样会因上面说的 `SO_REUSEADDR` 问题命中生产实例，测出来的是旧代码。
+  `e2e_candidates.py` 特意用空闲端口（17905），不要改成 17898。新服务会因排他绑定直接拒绝；如果 17898 上还是未重启的旧实例，测试服务仍可能因 `SO_REUSEADDR` 命中错误进程。
 - Windows 上 `.ps1` **必须带 UTF-8 BOM**。没有 BOM 时 PowerShell 5.1 按 ANSI(GBK) 解码，中文注释处解析就会乱，导致 `. python-runtime.ps1` 静默失效、报「Resolve-PythonRuntime 不是可识别的 cmdlet」。这个坑只在 `-File` 模式暴露，`-Command` 模式测不出来。
 - 不要在启动脚本里内联 Python 解析逻辑。必须 dot-source `python-runtime.ps1` —— 它把项目 `.venv` 排在第一候选并校验 3.10+，内联版两者都会丢，后果是依赖装在 `.venv`、服务却用系统 Python。
 
