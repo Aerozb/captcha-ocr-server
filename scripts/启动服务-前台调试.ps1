@@ -1,7 +1,7 @@
 ﻿$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
-. (Join-Path $PSScriptRoot 'python-runtime.ps1')
+. (Join-Path $PSScriptRoot '公共-查找Python.ps1')
 
 $root = [string](Resolve-Path (Join-Path $PSScriptRoot '..'))
 $server = Join-Path $root 'ocr\exmail_captcha_ocr_server.py'

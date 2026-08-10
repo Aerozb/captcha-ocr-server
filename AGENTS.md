@@ -36,21 +36,21 @@
 |------|------|
 | `ocr/exmail_captcha_ocr_server.py` | 服务本体，单文件 |
 | `tests/test_server.py` | HTTP 请求校验、路由、CORS、端口排他与启动预热的自动化测试 |
-| `scripts/install-dependencies.ps1` | 建 venv 并装依赖 |
-| `scripts/start-ocr-server.ps1` | 前台启动（调试用） |
-| `scripts/start-ocr-server-hidden.ps1` | 后台启动，幂等，带启动历史日志 |
-| `scripts/install-startup-task.ps1` | 注册开机自启计划任务 |
-| `scripts/uninstall-startup-task.ps1` | 卸载计划任务 |
-| `scripts/python-runtime.ps1` | 共享的 Python 解析（优先项目 `.venv`，校验 3.10+） |
-| `scripts/verify.ps1` | 部署自检 |
+| `scripts/安装依赖.ps1` | 建 venv 并装依赖 |
+| `scripts/启动服务-前台调试.ps1` | 前台启动（调试用） |
+| `scripts/启动服务-后台.ps1` | 后台启动，幂等，带启动历史日志 |
+| `scripts/安装开机自启.ps1` | 注册开机自启计划任务 |
+| `scripts/卸载开机自启.ps1` | 卸载计划任务 |
+| `scripts/公共-查找Python.ps1` | 共享的 Python 解析（优先项目 `.venv`，校验 3.10+） |
+| `scripts/部署自检.ps1` | 部署自检 |
 | `requirements.txt` | ddddocr、rapidocr-onnxruntime、Pillow、numpy |
 | `.local/` | **不入库**的测试资产：70 张样本、12 张人工标注真值集、诊断与评测脚本 |
 
 ## 怎么装
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install-dependencies.ps1
-powershell -ExecutionPolicy Bypass -File scripts\install-startup-task.ps1
+powershell -ExecutionPolicy Bypass -File scripts\安装依赖.ps1
+powershell -ExecutionPolicy Bypass -File scripts\安装开机自启.ps1
 ```
 
 需要 Python 3.10+。首次启动要加载三个 ONNX 模型，约几秒。
@@ -71,7 +71,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install-startup-task.ps1
 
   # 确认端口已释放，再启动
   netstat -ano | Select-String ':17898.*LISTENING'
-  powershell -ExecutionPolicy Bypass -File scripts\start-ocr-server-hidden.ps1
+  powershell -ExecutionPolicy Bypass -File scripts\启动服务-后台.ps1
   ```
 
   启动后核对 `logs\startup-history.log` 里的 `using python:` 一行确实指向本仓库的 `.venv`。注意正常情况下会看到**两个** python 进程且互为父子：`.venv\Scripts\python.exe` 是转发 stub，会拉起基础解释器作为子进程，这是 venv 的正常行为，不是多实例。
@@ -94,8 +94,8 @@ powershell -ExecutionPolicy Bypass -File scripts\install-startup-task.ps1
   `regress_after_fix.py` 把当前实现与 `.local/_old_server.py` 对比，后者是所有优化之前的原版快照（保留它是为了能随时验证「改了这么多之后字母识别没退化」）。它报告的「不同 33/70」是预期的，那些差异全部只在大小写上；真正要盯的是「含非 ASCII 应为 0」和耗时。
 
   `e2e_candidates.py` 特意用空闲端口（17905），不要改成 17898。新服务会因排他绑定直接拒绝；如果 17898 上还是未重启的旧实例，测试服务仍可能因 `SO_REUSEADDR` 命中错误进程。
-- Windows 上 `.ps1` **必须带 UTF-8 BOM**。没有 BOM 时 PowerShell 5.1 按 ANSI(GBK) 解码，中文注释处解析就会乱，导致 `. python-runtime.ps1` 静默失效、报「Resolve-PythonRuntime 不是可识别的 cmdlet」。这个坑只在 `-File` 模式暴露，`-Command` 模式测不出来。
-- 不要在启动脚本里内联 Python 解析逻辑。必须 dot-source `python-runtime.ps1` —— 它把项目 `.venv` 排在第一候选并校验 3.10+，内联版两者都会丢，后果是依赖装在 `.venv`、服务却用系统 Python。
+- Windows 上 `.ps1` **必须带 UTF-8 BOM**。没有 BOM 时 PowerShell 5.1 按 ANSI(GBK) 解码，中文注释处解析就会乱，导致 `. 公共-查找Python.ps1` 静默失效、报「Resolve-PythonRuntime 不是可识别的 cmdlet」。这个坑只在 `-File` 模式暴露，`-Command` 模式测不出来。
+- 不要在启动脚本里内联 Python 解析逻辑。必须 dot-source `公共-查找Python.ps1` —— 它把项目 `.venv` 排在第一候选并校验 3.10+，内联版两者都会丢，后果是依赖装在 `.venv`、服务却用系统 Python。
 
 ## 识别流程
 

@@ -13,26 +13,26 @@
 
 ```powershell
 # 1. 建 venv 并安装依赖（ddddocr、rapidocr-onnxruntime、Pillow、numpy）
-powershell -ExecutionPolicy Bypass -File scripts\install-dependencies.ps1
+powershell -ExecutionPolicy Bypass -File scripts\安装依赖.ps1
 
 # 2. 注册开机自启（可选，但推荐）
-powershell -ExecutionPolicy Bypass -File scripts\install-startup-task.ps1
+powershell -ExecutionPolicy Bypass -File scripts\安装开机自启.ps1
 ```
 
 装完可以自检：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\verify.ps1
+powershell -ExecutionPolicy Bypass -File scripts\部署自检.ps1
 ```
 
 ## 手动启动
 
 ```powershell
 # 后台启动（幂等，端口已健康就直接退出）
-powershell -ExecutionPolicy Bypass -File scripts\start-ocr-server-hidden.ps1
+powershell -ExecutionPolicy Bypass -File scripts\启动服务-后台.ps1
 
 # 前台启动，看实时输出，调试用
-powershell -ExecutionPolicy Bypass -File scripts\start-ocr-server.ps1
+powershell -ExecutionPolicy Bypass -File scripts\启动服务-前台调试.ps1
 ```
 
 首次启动要加载三个 ONNX 模型，约几秒。启动过程会记进 `logs\startup-history.log`。
@@ -163,14 +163,14 @@ Get-ScheduledTask -TaskName ExmailCaptchaOcrServer
 Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
   Where-Object { $_.CommandLine -like '*exmail_captcha_ocr_server*' } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-powershell -ExecutionPolicy Bypass -File scripts\start-ocr-server-hidden.ps1
+powershell -ExecutionPolicy Bypass -File scripts\启动服务-后台.ps1
 ```
 
 正常情况下会看到**两个** python 进程且互为父子——`.venv\Scripts\python.exe` 是转发 stub，会拉起基础解释器作为子进程，这是 venv 的正常行为。
 
 **移动过项目目录**
 
-计划任务里存的是绝对路径，移动后会失效。在新位置重跑 `install-startup-task.ps1` 即可（它用 `-Force` 覆盖注册）。`.venv` 里也有绝对路径，最好删掉重建。
+计划任务里存的是绝对路径，移动后会失效。在新位置重跑 `安装开机自启.ps1` 即可（它用 `-Force` 覆盖注册）。`.venv` 里也有绝对路径，最好删掉重建。
 
 **报「Resolve-PythonRuntime 不是可识别的 cmdlet」**
 

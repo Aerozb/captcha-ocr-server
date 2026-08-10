@@ -1,10 +1,10 @@
 ﻿$ErrorActionPreference = 'Stop'
 
-# 用共享的 python-runtime.ps1，不要在这里内联一份解析逻辑：共享版把项目
+# 用共享的 公共-查找Python.ps1，不要在这里内联一份解析逻辑：共享版把项目
 # .venv 排在第一候选并做 3.10+ 版本校验，内联版两者都没有。内联的后果是
 # 依赖装在 .venv、自启服务却用系统 Python，装了等于没装。已验证共享模块在
 # -NoProfile -WindowStyle Hidden 的自启上下文下能正常 dot-source。
-. (Join-Path $PSScriptRoot 'python-runtime.ps1')
+. (Join-Path $PSScriptRoot '公共-查找Python.ps1')
 
 $root = Resolve-Path (Join-Path $PSScriptRoot '..')
 $server = Join-Path $root 'ocr\exmail_captcha_ocr_server.py'
@@ -19,7 +19,7 @@ function Write-History($message) {
   Add-Content -LiteralPath $history -Value "[$stamp] $message"
 }
 
-Write-History "start-ocr-server-hidden invoked (user=$env:USERNAME)"
+Write-History "start-ocr-server (background) invoked (user=$env:USERNAME)"
 
 # Fast path: already running.
 try {

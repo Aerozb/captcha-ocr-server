@@ -1,7 +1,7 @@
 ﻿$ErrorActionPreference = 'Stop'
 
 $root = Resolve-Path (Join-Path $PSScriptRoot '..')
-$startScript = Join-Path $root 'scripts\start-ocr-server-hidden.ps1'
+$startScript = Join-Path $root 'scripts\启动服务-后台.ps1'
 $taskName = 'ExmailCaptchaOcrServer'
 
 if (-not (Test-Path -LiteralPath $startScript)) {
@@ -46,15 +46,42 @@ $settings = New-ScheduledTaskSettingsSet `
   -MultipleInstances IgnoreNew `
   -ExecutionTimeLimit ([TimeSpan]::Zero)
 
+# S4U (service-for-user) 而不是默认的 InteractiveToken。
+#
+# 不指定 -Principal 时 Register-ScheduledTask 默认用 InteractiveToken，语义是
+# 「仅在用户已登录时运行」。那样上面的 BootTrigger 形同虚设：开机那一刻还没有
+# 人登录，任务无法启动，而它恰恰是为「登录时刻的调度被时钟跳变干扰」准备的
+# 后备。实测确认过这一点：同样配 AtStartup，InteractiveToken 在未登录时不会
+# 启动，S4U 会。
+#
+# S4U 不需要在任务里保存密码（比 -LogonType Password 安全），代价是服务会在
+# 无人登录时也运行——对一个只监听 127.0.0.1 的本机服务可以接受。
+#
+# RunLevel 保持 Limited（不用 Highest）：服务只需绑定回环端口和读写自己的目录，
+# 不需要管理员权限，能跑就别提权。
+$principal = New-ScheduledTaskPrincipal `
+  -UserId "$env:USERDOMAIN\$env:USERNAME" `
+  -LogonType S4U `
+  -RunLevel Limited
+
 Register-ScheduledTask `
   -TaskName $taskName `
   -Action $action `
   -Trigger @($logonTrigger, $bootTrigger) `
   -Settings $settings `
+  -Principal $principal `
   -Description 'Start the local captcha OCR service on 127.0.0.1:17898 for auto-login scripts.' `
   -Force | Out-Null
 
+# 复核注册结果：LogonType 必须是 S4U，否则 BootTrigger 依旧无效。
+$registered = Get-ScheduledTask -TaskName $taskName
+$logonType = $registered.Principal.LogonType
+if ($logonType -ne 'S4U') {
+  Write-Warning "LogonType 注册为 $logonType 而不是 S4U；开机(未登录)时不会启动，只有登录触发器有效。"
+}
+
 Write-Host "Startup task installed: $taskName"
-Write-Host "  execute : $powershell"
-Write-Host "  script  : $startScript"
-Write-Host '  triggers: at logon, and at startup + 30s delay (backstop)'
+Write-Host "  execute  : $powershell"
+Write-Host "  script   : $startScript"
+Write-Host "  identity : $($registered.Principal.UserId)  LogonType=$logonType  RunLevel=$($registered.Principal.RunLevel)"
+Write-Host '  triggers : at logon, and at startup + 30s delay (works without login thanks to S4U)'
