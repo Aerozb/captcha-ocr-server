@@ -1,7 +1,7 @@
 ﻿$ErrorActionPreference = 'Stop'
 
 # 用共享的 公共-查找Python.ps1，不要在这里内联一份解析逻辑：共享版把项目
-# .venv 排在第一候选并做 3.10+ 版本校验，内联版两者都没有。内联的后果是
+# .venv 排在第一候选并做 Python 3.10-3.12 版本校验，内联版两者都没有。内联的后果是
 # 依赖装在 .venv、自启服务却用系统 Python，装了等于没装。已验证共享模块在
 # -NoProfile -WindowStyle Hidden 的自启上下文下能正常 dot-source。
 . (Join-Path $PSScriptRoot '公共-查找Python.ps1')

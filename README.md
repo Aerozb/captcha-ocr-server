@@ -1,4 +1,4 @@
-﻿# 验证码 OCR 本机服务
+# 验证码 OCR 本机服务
 
 本机图片验证码识别服务，**仅监听 `127.0.0.1:17898`**，不对外暴露。供自动登录脚本调用。
 
@@ -22,12 +22,12 @@ Windows 用户直接双击仓库根目录的 `OCR服务管理.bat`，即可在�
 ## 环境要求
 
 - Windows 10/11
-- Python 3.10+（3.12 实测可用）
+- Python 3.10-3.12（推荐 Python 3.12；Python 3.13 及以上不满足当前 rapidocr-onnxruntime 依赖）
 
 ## 命令行安装（进阶）
 
 ```powershell
-# 1. 建 venv 并安装依赖（ddddocr、rapidocr-onnxruntime、Pillow、numpy）
+# 1. 建 venv 并安装依赖（ddddocr、rapidocr-onnxruntime、Pillow、numpy；Python 3.10-3.12）
 powershell -ExecutionPolicy Bypass -File scripts\安装依赖.ps1
 
 # 2. 部署自检

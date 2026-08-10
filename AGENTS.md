@@ -44,7 +44,7 @@
 | `scripts/停止服务.ps1` | 只停止命令行中匹配本仓库服务脚本的 Python 进程 |
 | `scripts/安装开机自启.ps1` | 注册开机自启计划任务 |
 | `scripts/卸载开机自启.ps1` | 卸载计划任务 |
-| `scripts/公共-查找Python.ps1` | 共享的 Python 解析（优先项目 `.venv`，校验 3.10+） |
+| `scripts/公共-查找Python.ps1` | 共享的 Python 解析（优先项目 `.venv`，校验 Python 3.10-3.12） |
 | `scripts/部署自检.ps1` | 部署自检 |
 | `requirements.txt` | ddddocr、rapidocr-onnxruntime、Pillow、numpy |
 | `.local/` | **不入库**的测试资产：70 张样本、12 张人工标注真值集、诊断与评测脚本 |
@@ -62,7 +62,7 @@ powershell -ExecutionPolicy Bypass -File scripts\启动服务-后台.ps1
 powershell -ExecutionPolicy Bypass -File scripts\安装开机自启.ps1
 ```
 
-需要 Python 3.10+。首次启动要加载三个 ONNX 模型，约几秒。
+需要 Python 3.10-3.12，推荐 Python 3.12。rapidocr-onnxruntime 1.4.x 要求 Python 低于 3.13；共享运行时解析会优先尝试 Python 3.12、3.11、3.10，避免新系统的 py -3 选到不兼容版本。首次启动要加载三个 ONNX 模型，约几秒。
 
 ### 根目录管理入口约定
 
@@ -106,7 +106,7 @@ powershell -ExecutionPolicy Bypass -File scripts\安装开机自启.ps1
 
   `e2e_candidates.py` 特意用空闲端口（17905），不要改成 17898。新服务会因排他绑定直接拒绝；如果 17898 上还是未重启的旧实例，测试服务仍可能因 `SO_REUSEADDR` 命中错误进程。
 - Windows 上 `.ps1` **必须带 UTF-8 BOM**。没有 BOM 时 PowerShell 5.1 按 ANSI(GBK) 解码，中文注释处解析就会乱，导致 `. 公共-查找Python.ps1` 静默失效、报「Resolve-PythonRuntime 不是可识别的 cmdlet」。这个坑只在 `-File` 模式暴露，`-Command` 模式测不出来。
-- 不要在启动脚本里内联 Python 解析逻辑。必须 dot-source `公共-查找Python.ps1` —— 它把项目 `.venv` 排在第一候选并校验 3.10+，内联版两者都会丢，后果是依赖装在 `.venv`、服务却用系统 Python。
+- 不要在启动脚本里内联 Python 解析逻辑。必须 dot-source `公共-查找Python.ps1` —— 它把项目 `.venv` 排在第一候选并校验 Python 3.10-3.12，内联版两者都会丢，后果是依赖装在 `.venv`、服务却用系统 Python。
 
 ## 识别流程
 
