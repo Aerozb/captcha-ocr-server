@@ -49,46 +49,85 @@ $stampForFile = (Get-Date).ToString('yyyyMMdd-HHmmss')
 $log = Join-Path $logs "ocr-server-$stampForFile.log"
 $err = Join-Path $logs "ocr-server-$stampForFile.err.log"
 
-$argumentList = @($pythonArgs + @("`"$server`"")) -join ' '
+# Start-Process 配合 RedirectStandardOutput/RedirectStandardError 会让后台 Python
+# 继承调用链中的管道句柄。管理菜单虽然已经收到“服务可访问”，仍会等待该句柄关闭，
+# 表现为选项 [2] 一直停在成功消息后。通过 Win32_Process.Create 让 WMI 服务创建
+# 独立进程，再由 cmd.exe 把输出写入文件，可彻底断开菜单与常驻 Python 的句柄关系。
+function ConvertTo-CmdQuotedValue {
+  param([Parameter(Mandatory = $true)][string]$Value)
 
-$process = Start-Process `
-  -FilePath $python `
-  -ArgumentList $argumentList `
-  -WorkingDirectory $root `
-  -RedirectStandardOutput $log `
-  -RedirectStandardError $err `
-  -WindowStyle Hidden `
-  -PassThru
+  if ($Value.Contains('"')) {
+    throw "后台启动参数包含不受支持的双引号：$Value"
+  }
+  return '"' + $Value + '"'
+}
 
-Write-History "launched python pid=$($process.Id); stdout=$([System.IO.Path]::GetFileName($log)) stderr=$([System.IO.Path]::GetFileName($err))"
+$pythonCommandParts = New-Object System.Collections.Generic.List[string]
+$pythonCommandParts.Add((ConvertTo-CmdQuotedValue -Value $python))
+foreach ($argument in @($pythonArgs) + @([string]$server)) {
+  $pythonCommandParts.Add((ConvertTo-CmdQuotedValue -Value ([string]$argument)))
+}
+$pythonCommand = $pythonCommandParts -join ' '
+$commandLine = '"{0}" /d /s /c "{1} 1>>"{2}" 2>>"{3}""' -f `
+  $env:ComSpec, $pythonCommand, $log, $err
+
+try {
+  $startup = New-CimInstance `
+    -ClassName Win32_ProcessStartup `
+    -Namespace 'root/cimv2' `
+    -ClientOnly `
+    -Property @{ ShowWindow = [uint16]0 }
+  $launchResult = Invoke-CimMethod `
+    -ClassName Win32_Process `
+    -Namespace 'root/cimv2' `
+    -MethodName Create `
+    -Arguments @{
+      CommandLine = $commandLine
+      CurrentDirectory = [string]$root
+      ProcessStartupInformation = $startup
+    }
+} catch {
+  Write-History "FAILED to create detached process: $($_.Exception.Message)"
+  throw "创建 OCR 后台进程失败：$($_.Exception.Message)"
+}
+
+if ([int]$launchResult.ReturnValue -ne 0 -or [int]$launchResult.ProcessId -le 0) {
+  Write-History "FAILED Win32_Process.Create return=$($launchResult.ReturnValue) pid=$($launchResult.ProcessId)"
+  throw "创建 OCR 后台进程失败，Win32_Process.Create 返回码：$($launchResult.ReturnValue)"
+}
+
+$launcherPid = [int]$launchResult.ProcessId
+Write-History "launched detached command pid=$launcherPid; stdout=$([System.IO.Path]::GetFileName($log)) stderr=$([System.IO.Path]::GetFileName($err))"
 
 # Model loading takes a few seconds. Poll the health endpoint so the history
 # records whether the service actually became reachable, and whether the
-# process survived startup.
+# detached cmd/Python process survived startup.
 $ready = $false
+$launcherExited = $false
 for ($i = 0; $i -lt 30; $i++) {
   Start-Sleep -Milliseconds 1000
-  if ($process.HasExited) {
+  $launcherProcess = Get-Process -Id $launcherPid -ErrorAction SilentlyContinue
+  if ($null -eq $launcherProcess) {
+    $launcherExited = $true
     $errText = ''
     try { $errText = (Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue) } catch {}
-    Write-History "python EXITED early with code $($process.ExitCode) after ~$($i + 1)s; stderr: $($errText.Trim())"
+    Write-History "detached command EXITED early after ~$($i + 1)s; stderr: $($errText.Trim())"
     break
   }
   try {
     $h = Invoke-RestMethod 'http://127.0.0.1:17898/' -TimeoutSec 2
     if ($h.ok) {
       $ready = $true
-      Write-History "OCR service READY after ~$($i + 1)s (pid=$($process.Id))"
+      Write-History "OCR service READY after ~$($i + 1)s (launcher-pid=$launcherPid)"
       break
     }
   } catch {
   }
 }
 
-if (-not $ready -and -not $process.HasExited) {
-  Write-History "OCR service not reachable within 30s but python pid=$($process.Id) still running"
+if (-not $ready -and -not $launcherExited) {
+  Write-History "OCR service not reachable within 30s but detached command pid=$launcherPid is still running"
 }
-
 # Prune startup logs older than 7 days to bound disk usage.
 Get-ChildItem -LiteralPath $logs -Filter 'ocr-server-*.log' -ErrorAction SilentlyContinue |
   Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |

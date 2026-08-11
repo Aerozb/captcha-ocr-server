@@ -132,28 +132,29 @@ function Invoke-RepositoryScript {
   }
 
   try {
-    $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $scriptPath + '"'
-    $startParameters = @{
-      FilePath = $powershell
-      ArgumentList = $arguments
-      WorkingDirectory = $root
-      NoNewWindow = $true
-      Wait = $true
-      PassThru = $true
+    # 直接调用子 PowerShell，让输出直接写入当前控制台。这里不要接 `| Out-Host`：
+    # 管道会创建匿名输出句柄，后台 Python 继承该句柄后，菜单会一直等待管道关闭。
+    # 直接调用只等待当前功能脚本退出，不等待它启动的后台服务进程。
+    $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath)
+    Push-Location -LiteralPath $root
+    try {
+      & $powershell @arguments
+      $exitCode = $LASTEXITCODE
+    } finally {
+      Pop-Location
     }
-    $process = Start-Process @startParameters
   } catch {
     Write-Host "[失败] $DisplayName 启动异常：$($_.Exception.Message)" -ForegroundColor Red
     return $false
   }
 
   Write-Host ('-' * 68) -ForegroundColor DarkGray
-  if ($process.ExitCode -eq 0) {
+  if ($exitCode -eq 0) {
     Write-Host "[成功] $DisplayName 已完成。" -ForegroundColor Green
     return $true
   }
 
-  Write-Host "[失败] $DisplayName 退出码：$($process.ExitCode)" -ForegroundColor Red
+  Write-Host "[失败] $DisplayName 退出码：$exitCode" -ForegroundColor Red
   return $false
 }
 
