@@ -1,6 +1,8 @@
 ﻿$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
+. (Join-Path $PSScriptRoot '公共-查找Python.ps1')
+
 $root = [string](Resolve-Path (Join-Path $PSScriptRoot '..'))
 $scriptsRoot = Join-Path $root 'scripts'
 $logsRoot = Join-Path $root 'logs'
@@ -48,6 +50,31 @@ function Get-StartupTaskStateText {
   }
 }
 
+function Show-DependencyEnvironmentState {
+  Write-Host -NoNewline '依赖环境：'
+  $venvRoot = Join-Path $root '.venv'
+  $venvPython = Join-Path $venvRoot 'Scripts\python.exe'
+
+  if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+    if (Test-Path -LiteralPath $venvRoot) {
+      Write-Host '.venv 未完成（选择 [1] 自动修复）' -ForegroundColor Yellow
+    } else {
+      Write-Host '尚未安装' -ForegroundColor Yellow
+    }
+    return
+  }
+
+  $runtime = [pscustomobject]@{ Command = $venvPython; Args = @(); Source = 'project .venv' }
+  $version = Get-PythonVersion -Runtime $runtime
+  if ($null -eq $version) {
+    Write-Host '.venv 已损坏（选择 [1] 自动修复）' -ForegroundColor Red
+  } elseif (-not (Test-PythonRuntime -Runtime $runtime)) {
+    Write-Host ".venv Python $version 不兼容（选择 [1] 自动修复）" -ForegroundColor Red
+  } else {
+    Write-Host ".venv Python $version" -ForegroundColor Green
+  }
+}
+
 function Show-Menu {
   Clear-Host
   Write-Host ('=' * 68) -ForegroundColor DarkCyan
@@ -62,16 +89,11 @@ function Show-Menu {
     Write-Host '未运行' -ForegroundColor Yellow
   }
 
-  Write-Host -NoNewline '依赖环境：'
-  if (Test-Path -LiteralPath (Join-Path $root '.venv\Scripts\python.exe')) {
-    Write-Host '.venv 已创建' -ForegroundColor Green
-  } else {
-    Write-Host '尚未安装' -ForegroundColor Yellow
-  }
+  Show-DependencyEnvironmentState
 
   Write-Host "开机自启：$(Get-StartupTaskStateText)"
   Write-Host ''
-  Write-Host '  [1] 安装或更新依赖'
+  Write-Host '  [1] 一键安装或更新（Python + OCR 依赖）'
   Write-Host '  [2] 后台启动服务（推荐）'
   Write-Host '  [3] 前台调试启动（新窗口）'
   Write-Host '  [4] 停止服务'
